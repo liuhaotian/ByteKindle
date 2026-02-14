@@ -1,13 +1,13 @@
 /**
  * ByteKindle - Worker AI Edition
- * Version: v7.6.0 (SDXL Max Steps & Gemma 3 Narrative)
+ * Version: v8.0.0 (Pure Defaults & Fluid Scale)
  */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const hero = url.searchParams.get("hero") || "";
-    const heroKey = `bk_v7_${encodeURIComponent(hero.toLowerCase().trim().replace(/\s+/g, '_'))}`;
+    const heroKey = `bk_v8_${encodeURIComponent(hero.toLowerCase().trim().replace(/\s+/g, '_'))}`;
 
     if (url.pathname === "/start") {
       const existingStoryRaw = await env.KV.get(heroKey);
@@ -17,29 +17,24 @@ export default {
         await env.KV.put(heroKey, JSON.stringify(state), { expirationTtl: 604800 });
         return Response.redirect(`${url.origin}/view?hero=${encodeURIComponent(hero)}`, 302);
       }
-
       const scenes = await generateStoryWithGemma3(env, hero);
-      await env.KV.put(heroKey, JSON.stringify({
-        scenes: scenes,
-        currentIndex: 0
-      }), { expirationTtl: 604800 });
-      
+      await env.KV.put(heroKey, JSON.stringify({ scenes, currentIndex: 0 }), { expirationTtl: 604800 });
       return Response.redirect(`${url.origin}/view?hero=${encodeURIComponent(hero)}`, 302);
     }
 
     if (url.pathname === "/view") {
       const state = await env.KV.get(heroKey, { type: "json" });
       if (!state) return Response.redirect(url.origin, 302);
-      return new Response(renderSeamlessViewer(hero, state), {
-        headers: { "Content-Type": "text/html; charset=UTF-8" }
-      });
+      return new Response(renderSeamlessViewer(hero, state), { headers: { "Content-Type": "text/html; charset=UTF-8" } });
     }
 
     if (url.pathname === "/api/image.png") {
       const sceneIndex = parseInt(url.searchParams.get("index") || "0");
       const state = await env.KV.get(heroKey, { type: "json" });
       if (!state || !state.scenes[sceneIndex]) return new Response("Not Found", { status: 404 });
-      return await generateSceneImage(env, state.scenes[sceneIndex]);
+      
+      const image = await generateSceneImage(env, state.scenes[sceneIndex]);
+      return new Response(image, { headers: { "Content-Type": "image/png" } });
     }
 
     if (url.pathname === "/api/next") {
@@ -57,62 +52,50 @@ export default {
 };
 
 /**
- * Story Engine: Gemma 3 12B via Gemini API
+ * Story Engine: Gemma 3 12B
+ * Optimized for 12-18 scenes with tactile, color-free descriptions.
  */
 async function generateStoryWithGemma3(env, hero) {
   const model = "gemma-3-12b-it";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
   
   const promptText = `Task: Write a children's story about ${hero} for a 2yo.
-  
-  Format: Exactly 15 plain text lines. No intro, no outro, no numbers.
-  
-  Physical Anchor: A 3-5 descriptive words of the ${hero} including ${hero}.
-  
-  Constraint: Every line MUST start with this Anchor. Every line MUST be a different action. Every line shall be around 20 words.
-  
+  Format: Plain text lines (12 to 18 lines). No intro, no outro, no numbers.
+  Physical Anchor: 3-5 descriptive words of the ${hero} (including ${hero}) focusing on geometry and cartoon shapes. NO COLORS.
+  Constraint: Every line MUST start with this Anchor. Every line MUST be a different action. Every line around 20 words.
   Progression: Start adventure, meet friends, solve a tiny problem.
-  
-  Context: each line will be used independently for generating scene image display on black and white kindle for kids to read.`;
+  Context: Black and white Kindle display. Use textures like "fuzzy," "shiny," "spotted," or "striped" instead of colors.`;
 
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: promptText }] }],
-      generationConfig: { temperature: 0.8 }
-    })
+    body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.8 } })
   });
 
   const data = await response.json();
   const rawText = data.candidates[0].content.parts[0].text;
   
-  // Requirement: Backend log raw response for AI debug
+  // Requirement: Backend log raw response for debugging
   console.log(`[ByteKindle AI Response]: ${rawText}`);
-
-  const lines = rawText.split('\n')
-    .map(line => line.trim())
-    .filter(line => line.length > 15 && !line.includes('{') && !line.includes('**'));
   
-  return lines.slice(0, 15);
+  return rawText.split('\n').map(l => l.trim()).filter(l => l.length > 15);
 }
 
 /**
- * Image Engine: SDXL Base 1.0 (Kindle Optimized)
+ * Image Engine: SDXL Base 1.0
+ * Using default num_steps and guidance for maximum stability.
  */
 async function generateSceneImage(env, currentScene) {
   const inputs = {
-    prompt: `${currentScene}. High-contrast black and white charcoal sketch, bold thick outlines, minimalist white background, children's storybook style, e-ink screen optimized, sharp lines.`,
-    num_steps: 20, // Max steps for SDXL-Base on Workers
-    guidance: 8.5
+    prompt: `${currentScene}. High-contrast monochromatic charcoal sketch, bold thick black ink outlines, white background, minimalist cartoon style, e-ink screen optimized, sharp 16-level grayscale textures.`,
+    // num_steps removed to use system defaults
+    guidance: 7.5
   };
-
-  const image = await env.AI.run("@cf/stabilityai/stable-diffusion-xl-base-1.0", inputs);
-  return new Response(image, { headers: { "Content-Type": "image/png" } });
+  return await env.AI.run("@cf/stabilityai/stable-diffusion-xl-base-1.0", inputs);
 }
 
 /**
- * UI: Viewer Page
+ * UI: Seamless Viewer with Predictive Preloading
  */
 function renderSeamlessViewer(hero, state) {
   const total = state.scenes.length;
@@ -123,29 +106,44 @@ function renderSeamlessViewer(hero, state) {
     html, body { width: 100%; height: 100%; overflow: hidden; background: #fff; font-family: Arial, sans-serif; position: fixed; }
     #view-wrapper { width: 100%; position: absolute; top: 0; left: 0; }
     .nav { width: 100%; border-bottom: 3px solid #000; height: 110px; display: table; table-layout: fixed; }
-    .cell { display: table-cell; vertical-align: middle; text-align: center; overflow: hidden; }
+    .cell { display: table-cell; vertical-align: middle; text-align: center; }
     .info-box { text-align: left; padding-left: 15px; }
     #scene-num { font-size: 14px; display: block; color: #444; }
     #scene-desc { font-size: 16px; font-weight: bold; line-height: 1.2; display: block; height: 44px; overflow: hidden; }
     .btn { text-decoration: none; color: #000; font-weight: bold; font-size: 24px; display: block; line-height: 110px; }
     .btn-next { background: #000; color: #fff; }
-    #main-img { width: 100% !important; height: auto !important; display: block; border: 0; }
+    #main-img { width: 100%; height: auto; display: block; border: 0; }
   </style>
   <script>
     document.addEventListener('touchmove', function(e) { e.preventDefault(); }, { passive: false });
+    
+    let currentIdx = ${state.currentIndex};
+    const heroEncoded = "${encodeURIComponent(hero)}";
+
+    function preloadNext() {
+      const nextIdx = (currentIdx + 1) % ${total};
+      const img = new Image();
+      img.src = '/api/image.png?hero=' + heroEncoded + '&index=' + nextIdx;
+      img.onload = () => console.log("Cached Scene " + nextIdx);
+    }
+
     function nextScene() {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/next?hero=${encodeURIComponent(hero)}', true);
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/next?hero=' + heroEncoded, true);
       xhr.onreadystatechange = function() {
         if (xhr.readyState == 4 && xhr.status == 200) {
-          var data = JSON.parse(xhr.responseText);
-          document.getElementById('main-img').src = '/api/image.png?hero=${encodeURIComponent(hero)}&index=' + data.index + '&t=' + new Date().getTime();
-          document.getElementById('scene-num').innerHTML = 'Scene ' + (data.index + 1) + '/' + ${total};
+          const data = JSON.parse(xhr.responseText);
+          currentIdx = data.index;
+          document.getElementById('main-img').src = '/api/image.png?hero=' + heroEncoded + '&index=' + currentIdx;
+          document.getElementById('scene-num').innerHTML = 'Scene ' + (currentIdx + 1) + '/' + ${total};
           document.getElementById('scene-desc').innerHTML = data.desc;
+          setTimeout(preloadNext, 800);
         }
       };
       xhr.send();
     }
+
+    window.onload = () => setTimeout(preloadNext, 2000);
   </script></head>
   <body>
     <div id="view-wrapper">
@@ -164,9 +162,6 @@ function renderSeamlessViewer(hero, state) {
   </body></html>`;
 }
 
-/**
- * UI: Setup Page (Keyboard Optimized)
- */
 function renderSetup() {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -180,10 +175,7 @@ function renderSetup() {
   <body>
     <div id="setup-container">
       <h2>Who is the Hero?</h2>
-      <form method="GET" action="/start">
-        <input type="text" name="hero" placeholder="Brave Bee" required autofocus>
-        <button type="submit">GO</button>
-      </form>
+      <form method="GET" action="/start"><input type="text" name="hero" placeholder="Brave Bee" required autofocus><button type="submit">GO</button></form>
     </div>
   </body></html>`;
 }
