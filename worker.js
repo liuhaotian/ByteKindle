@@ -1,6 +1,7 @@
 /**
  * ByteKindle - Worker AI Edition
- * Version: v8.3.0 (Baseline v8.0.0 + Native Visual Swap)
+ * Version: v8.6.1 (Rebased Debug Pass-Through)
+ * Logic: v8.3.0 Baseline + Polymorphic Debug
  */
 
 export default {
@@ -9,6 +10,15 @@ export default {
     const hero = url.searchParams.get("hero") || "";
     const heroKey = `bk_v8_${encodeURIComponent(hero.toLowerCase().trim().replace(/\s+/g, '_'))}`;
 
+    // --- ROUTE: DEBUG ---
+    if (url.pathname === "/debug") {
+      const testPrompt = url.searchParams.get("prompt") || "";
+      return new Response(renderDebug(testPrompt), {
+        headers: { "Content-Type": "text/html; charset=UTF-8" }
+      });
+    }
+
+    // --- ROUTE: START ---
     if (url.pathname === "/start") {
       const existingStoryRaw = await env.KV.get(heroKey);
       if (existingStoryRaw) {
@@ -22,21 +32,33 @@ export default {
       return Response.redirect(`${url.origin}/view?hero=${encodeURIComponent(hero)}`, 302);
     }
 
+    // --- ROUTE: VIEW ---
     if (url.pathname === "/view") {
       const state = await env.KV.get(heroKey, { type: "json" });
       if (!state) return Response.redirect(url.origin, 302);
       return new Response(renderSeamlessViewer(hero, state), { headers: { "Content-Type": "text/html; charset=UTF-8" } });
     }
 
+    // --- ROUTE: POLYMORPHIC IMAGE API ---
     if (url.pathname === "/api/image.png") {
-      const sceneIndex = parseInt(url.searchParams.get("index") || "0");
-      const state = await env.KV.get(heroKey, { type: "json" });
-      if (!state || !state.scenes[sceneIndex]) return new Response("Not Found", { status: 404 });
+      const promptOverride = url.searchParams.get("prompt");
       
-      const image = await generateSceneImage(env, state.scenes[sceneIndex]);
-      return new Response(image, { headers: { "Content-Type": "image/png" } });
+      if (promptOverride) {
+        // DEBUG MODE: Full clean prompt pass-through (isRaw = true)
+        const image = await generateSceneImage(env, promptOverride, true);
+        return new Response(image, { headers: { "Content-Type": "image/png" } });
+      } else {
+        // PRODUCTION MODE: Apply E-Ink grayscale wrapper (isRaw = false)
+        const sceneIndex = parseInt(url.searchParams.get("index") || "0");
+        const state = await env.KV.get(heroKey, { type: "json" });
+        if (!state || !state.scenes[sceneIndex]) return new Response("Not Found", { status: 404 });
+        
+        const image = await generateSceneImage(env, state.scenes[sceneIndex], false);
+        return new Response(image, { headers: { "Content-Type": "image/png" } });
+      }
     }
 
+    // --- ROUTE: NEXT ---
     if (url.pathname === "/api/next") {
       const state = await env.KV.get(heroKey, { type: "json" });
       if (state) {
@@ -51,6 +73,9 @@ export default {
   }
 };
 
+/**
+ * Story Engine: Gemma 3 12B
+ */
 async function generateStoryWithGemma3(env, hero) {
   const model = "gemma-3-12b-it";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
@@ -72,12 +97,56 @@ async function generateStoryWithGemma3(env, hero) {
   return rawText.split('\n').map(l => l.trim()).filter(l => l.length > 15);
 }
 
-async function generateSceneImage(env, currentScene) {
+/**
+ * Generalized Image Engine: SDXL Base 1.0
+ * @param {boolean} isRaw - If true, passes the prompt as-is.
+ */
+async function generateSceneImage(env, prompt, isRaw = false) {
+  const finalPrompt = isRaw 
+    ? prompt 
+    : `${prompt}. High-contrast monochromatic charcoal sketch, bold thick black ink outlines, white background, minimalist cartoon style, e-ink screen optimized, sharp 16-level grayscale textures.`;
+  
   const inputs = {
-    prompt: `${currentScene}. High-contrast monochromatic charcoal sketch, bold thick black ink outlines, white background, minimalist cartoon style, e-ink screen optimized, sharp 16-level grayscale textures.`,
+    prompt: finalPrompt,
     guidance: 7.5
   };
   return await env.AI.run("@cf/stabilityai/stable-diffusion-xl-base-1.0", inputs);
+}
+
+// --- RENDERING FUNCTIONS ---
+
+function renderDebug(testPrompt) {
+  let resultHtml = "";
+  if (testPrompt) {
+    resultHtml = `
+      <div style="margin-top:20px; border-top: 3px solid #000; padding-top:20px;">
+        <h3>Raw AI Output:</h3>
+        <img src="/api/image.png?prompt=${encodeURIComponent(testPrompt)}" style="width:100%; max-width:512px; border:4px solid #000;">
+        <p><i>Full Prompt Sent: ${testPrompt}</i></p>
+      </div>`;
+  }
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Debug</title>
+  <style>
+    body { font-family: monospace; padding: 20px; line-height: 1.5; background: #f4f4f4; }
+    .container { max-width: 600px; margin: 0 auto; background: #fff; padding: 20px; border: 2px solid #000; }
+    input { width: 100%; padding: 12px; border: 2px solid #000; font-size: 16px; margin-bottom: 10px; box-sizing: border-box; }
+    button { width: 100%; padding: 12px; background: #000; color: #fff; border: none; font-weight: bold; cursor: pointer; }
+    .footer { font-size: 11px; color: #666; margin-top: 20px; }
+  </style></head>
+  <body>
+    <div class="container">
+      <h1>ByteKindle v8.6 Debug</h1>
+      <form method="GET" action="/debug">
+        <input type="text" name="prompt" value="${testPrompt}" placeholder="Enter full raw prompt..." required>
+        <button type="submit">GENERATE RAW IMAGE</button>
+      </form>
+      ${resultHtml}
+      <div class="footer">
+        Baseline: v8.3.0 rebased (v8.6.1)<br>
+        Models: Gemma 3 / SDXL 1.0
+      </div>
+    </div>
+  </body></html>`;
 }
 
 function renderSeamlessViewer(hero, state) {
@@ -111,13 +180,9 @@ function renderSeamlessViewer(hero, state) {
           var data = JSON.parse(xhr.responseText);
           currentIdx = data.index;
           nextIdx = (currentIdx + 1) % ${total};
-          
-          // NATIVE SWAP: Main image takes the preview's src
           document.getElementById('main-img').src = document.getElementById('next-preview').src;
           document.getElementById('scene-num').innerHTML = 'Scene ' + (currentIdx + 1) + '/' + ${total};
           document.getElementById('scene-desc').innerHTML = data.desc;
-          
-          // Immediately set next preview to trigger native browser load
           document.getElementById('next-preview').src = '/api/image.png?hero=${heroEnc}&index=' + nextIdx;
         }
       };
