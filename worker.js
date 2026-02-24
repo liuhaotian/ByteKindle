@@ -1,14 +1,13 @@
 /**
  * ByteKindle - Worker AI Edition
- * Version: v8.6.1 (Rebased Debug Pass-Through)
- * Logic: v8.3.0 Baseline + Polymorphic Debug
+ * Version: v8.9.3 (Vector Logic + v8.3.0 UI Baseline)
  */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const hero = url.searchParams.get("hero") || "";
-    const heroKey = `bk_v8_${encodeURIComponent(hero.toLowerCase().trim().replace(/\s+/g, '_'))}`;
+    const hero = (url.searchParams.get("hero") || "").toLowerCase().trim();
+    const heroKey = `bk_v8_vector_${encodeURIComponent(hero.replace(/\s+/g, '_'))}`;
 
     // --- ROUTE: DEBUG ---
     if (url.pathname === "/debug") {
@@ -18,17 +17,20 @@ export default {
       });
     }
 
-    // --- ROUTE: START ---
+    // --- ROUTE: START (Added KV Caching & Gemma 3 Vector Eng) ---
     if (url.pathname === "/start") {
-      const existingStoryRaw = await env.KV.get(heroKey);
-      if (existingStoryRaw) {
-        const state = JSON.parse(existingStoryRaw);
+      if (!hero) return Response.redirect(url.origin, 302);
+      
+      const cached = await env.KV.get(heroKey);
+      if (cached) {
+        const state = JSON.parse(cached);
         state.currentIndex = 0;
-        await env.KV.put(heroKey, JSON.stringify(state), { expirationTtl: 604800 });
+        await env.KV.put(heroKey, JSON.stringify(state), { expirationTtl: 1209600 });
         return Response.redirect(`${url.origin}/view?hero=${encodeURIComponent(hero)}`, 302);
       }
-      const scenes = await generateStoryWithGemma3(env, hero);
-      await env.KV.put(heroKey, JSON.stringify({ scenes, currentIndex: 0 }), { expirationTtl: 604800 });
+
+      const scenes = await generateVectorPrompts(env, hero);
+      await env.KV.put(heroKey, JSON.stringify({ scenes, currentIndex: 0 }), { expirationTtl: 1209600 });
       return Response.redirect(`${url.origin}/view?hero=${encodeURIComponent(hero)}`, 302);
     }
 
@@ -39,23 +41,26 @@ export default {
       return new Response(renderSeamlessViewer(hero, state), { headers: { "Content-Type": "text/html; charset=UTF-8" } });
     }
 
-    // --- ROUTE: POLYMORPHIC IMAGE API ---
+    // --- ROUTE: IMAGE API (Index-based, Raw Prompt Support) ---
     if (url.pathname === "/api/image.png") {
       const promptOverride = url.searchParams.get("prompt");
-      
-      if (promptOverride) {
-        // DEBUG MODE: Full clean prompt pass-through (isRaw = true)
-        const image = await generateSceneImage(env, promptOverride, true);
-        return new Response(image, { headers: { "Content-Type": "image/png" } });
-      } else {
-        // PRODUCTION MODE: Apply E-Ink grayscale wrapper (isRaw = false)
+      let finalPrompt = promptOverride;
+
+      if (!finalPrompt) {
         const sceneIndex = parseInt(url.searchParams.get("index") || "0");
         const state = await env.KV.get(heroKey, { type: "json" });
-        if (!state || !state.scenes[sceneIndex]) return new Response("Not Found", { status: 404 });
-        
-        const image = await generateSceneImage(env, state.scenes[sceneIndex], false);
-        return new Response(image, { headers: { "Content-Type": "image/png" } });
+        if (state && state.scenes[sceneIndex]) {
+          finalPrompt = state.scenes[sceneIndex];
+        }
       }
+
+      if (!finalPrompt) return new Response("Not Found", { status: 404 });
+
+      const image = await env.AI.run("@cf/stabilityai/stable-diffusion-xl-base-1.0", { 
+        prompt: finalPrompt, 
+        guidance: 7.5 
+      });
+      return new Response(image, { headers: { "Content-Type": "image/png" } });
     }
 
     // --- ROUTE: NEXT ---
@@ -63,7 +68,7 @@ export default {
       const state = await env.KV.get(heroKey, { type: "json" });
       if (state) {
         state.currentIndex = (state.currentIndex + 1) >= state.scenes.length ? 0 : state.currentIndex + 1;
-        await env.KV.put(heroKey, JSON.stringify(state), { expirationTtl: 604800 });
+        await env.KV.put(heroKey, JSON.stringify(state), { expirationTtl: 1209600 });
         return new Response(JSON.stringify({ index: state.currentIndex, desc: state.scenes[state.currentIndex] }));
       }
       return new Response("Error", { status: 500 });
@@ -74,17 +79,20 @@ export default {
 };
 
 /**
- * Story Engine: Gemma 3 12B
+ * Vector Engineer: Gemma 3 12B
  */
-async function generateStoryWithGemma3(env, hero) {
+async function generateVectorPrompts(env, hero) {
   const model = "gemma-3-12b-it";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
-  const promptText = `Task: Write a children's story about ${hero} for a 2yo.
-  Format: Plain text lines (12 to 18 lines). No intro, no outro, no numbers.
-  Physical Anchor: 3-5 descriptive words of the ${hero} (including ${hero}) focusing on geometry and cartoon shapes. NO COLORS.
-  Constraint: Every line MUST start with this Anchor. Every line MUST be a different action. Every line around 20 words.
-  Progression: Start adventure, meet friends, solve a tiny problem.
-  Context: Black and white Kindle display. Use textures like "fuzzy," "shiny," "spotted," or "striped" instead of colors.`;
+  
+  const promptText = `Task: SDXL Vector Activation for a 2yo.
+  Subject: ${hero}.
+  Requirements: 
+  - Generate 12-18 distinct scenes.
+  - Mix ${hero} with kid 8-10 elements (bees, butterflies, clouds, toys, etc).
+  - Output ONLY raw comma-separated tokens per line per scene. 
+  - Style: "grayscale".
+  - NO FULL SENTENCES. No numbering.`;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -93,33 +101,16 @@ async function generateStoryWithGemma3(env, hero) {
   });
   const data = await response.json();
   const rawText = data.candidates[0].content.parts[0].text;
-  console.log(`[ByteKindle AI Response]: ${rawText}`);
-  return rawText.split('\n').map(l => l.trim()).filter(l => l.length > 15);
+  console.log(`[Vector Prompt Generation]: ${rawText}`);
+  return rawText.split('\n').map(l => l.trim()).filter(l => l.length > 10);
 }
 
-/**
- * Generalized Image Engine: SDXL Base 1.0
- * @param {boolean} isRaw - If true, passes the prompt as-is.
- */
-async function generateSceneImage(env, prompt, isRaw = false) {
-  const finalPrompt = isRaw 
-    ? prompt 
-    : `${prompt}. High-contrast monochromatic charcoal sketch, bold thick black ink outlines, white background, minimalist cartoon style, e-ink screen optimized, sharp 16-level grayscale textures.`;
-  
-  const inputs = {
-    prompt: finalPrompt,
-    guidance: 7.5
-  };
-  return await env.AI.run("@cf/stabilityai/stable-diffusion-xl-base-1.0", inputs);
-}
-
-// --- RENDERING FUNCTIONS ---
+// --- RENDERING FUNCTIONS (STRICTLY v8.3.0 BASELINE) ---
 
 function renderDebug(testPrompt) {
   let resultHtml = "";
   if (testPrompt) {
-    resultHtml = `
-      <div style="margin-top:20px; border-top: 3px solid #000; padding-top:20px;">
+    resultHtml = `<div style="margin-top:20px; border-top: 3px solid #000; padding-top:20px;">
         <h3>Raw AI Output:</h3>
         <img src="/api/image.png?prompt=${encodeURIComponent(testPrompt)}" style="width:100%; max-width:512px; border:4px solid #000;">
         <p><i>Full Prompt Sent: ${testPrompt}</i></p>
@@ -131,20 +122,15 @@ function renderDebug(testPrompt) {
     .container { max-width: 600px; margin: 0 auto; background: #fff; padding: 20px; border: 2px solid #000; }
     input { width: 100%; padding: 12px; border: 2px solid #000; font-size: 16px; margin-bottom: 10px; box-sizing: border-box; }
     button { width: 100%; padding: 12px; background: #000; color: #fff; border: none; font-weight: bold; cursor: pointer; }
-    .footer { font-size: 11px; color: #666; margin-top: 20px; }
   </style></head>
   <body>
     <div class="container">
-      <h1>ByteKindle v8.6 Debug</h1>
+      <h1>ByteKindle Debug</h1>
       <form method="GET" action="/debug">
         <input type="text" name="prompt" value="${testPrompt}" placeholder="Enter full raw prompt..." required>
         <button type="submit">GENERATE RAW IMAGE</button>
       </form>
       ${resultHtml}
-      <div class="footer">
-        Baseline: v8.3.0 rebased (v8.6.1)<br>
-        Models: Gemma 3 / SDXL 1.0
-      </div>
     </div>
   </body></html>`;
 }
@@ -180,9 +166,13 @@ function renderSeamlessViewer(hero, state) {
           var data = JSON.parse(xhr.responseText);
           currentIdx = data.index;
           nextIdx = (currentIdx + 1) % ${total};
+          
+          // NATIVE SWAP: Main image takes the preview's src
           document.getElementById('main-img').src = document.getElementById('next-preview').src;
           document.getElementById('scene-num').innerHTML = 'Scene ' + (currentIdx + 1) + '/' + ${total};
           document.getElementById('scene-desc').innerHTML = data.desc;
+          
+          // Immediately set next preview to trigger native browser load
           document.getElementById('next-preview').src = '/api/image.png?hero=${heroEnc}&index=' + nextIdx;
         }
       };
